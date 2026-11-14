@@ -36,7 +36,6 @@ export default function Dashboard() {
   const [status, setStatus] = useState<UploadState>("idle");
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState("");
-  const [videoUrl, setVideoUrl] = useState("");
   const [dragging, setDragging] = useState(false);
   const [user, setUser] = useState<User | null>(null);
   const [checkingAuth, setCheckingAuth] = useState(true);
@@ -55,7 +54,6 @@ export default function Dashboard() {
 
   function chooseFile(candidate?: File) {
     setError("");
-    setVideoUrl("");
     setProgress(0);
     if (!candidate) return;
     if (!VIDEO_TYPES.includes(candidate.type)) {
@@ -89,7 +87,7 @@ export default function Dashboard() {
     setError("");
     try {
       const blob = await upload(file.name, file, {
-        access: "public",
+        access: "private",
         handleUploadUrl: "/api/upload",
         multipart: true,
         onUploadProgress: ({ percentage }) => setProgress(Math.round(percentage)),
@@ -106,7 +104,6 @@ export default function Dashboard() {
         progress: 100,
       });
       if (databaseError) throw new Error(`Video terunggah, tetapi pencatatan database gagal: ${databaseError.message}`);
-      setVideoUrl(blob.url);
       setProgress(100);
       setStatus("done");
     } catch (uploadError) {
@@ -120,7 +117,6 @@ export default function Dashboard() {
     setStatus("idle");
     setProgress(0);
     setError("");
-    setVideoUrl("");
     if (inputRef.current) inputRef.current.value = "";
   }
 
@@ -171,7 +167,7 @@ export default function Dashboard() {
               {status !== "uploading" && <button className="remove" aria-label="Hapus video" onClick={clearFile}><X size={18} /></button>}
               {(status === "uploading" || status === "done") && <div className="progress-row"><div className="progress-track"><span style={{ width: `${progress}%` }} /></div><b>{progress}%</b></div>}
               {status === "done" && <div className="success"><CheckCircle2 size={17} /> Upload selesai. Video siap diproses.</div>}
-              {videoUrl && <a className="video-link" href={videoUrl} target="_blank" rel="noreferrer">Buka video</a>}
+              {status === "done" && <span className="private-note">Tersimpan privat · hanya akunmu yang dapat mengakses</span>}
             </div>
           )}
 
