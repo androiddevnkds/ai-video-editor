@@ -118,7 +118,11 @@ async function transcribeChunksLocal(directory) {
   for (const name of files) {
     const path = join(directory, name);
     const duration = await ffprobeDuration(path);
-    const result = await localTranscriber(path, { chunk_length_s: 30, stride_length_s: 5, return_timestamps: true, language: "indonesian", task: "transcribe" });
+    const rawPath = `${path}.f32le`;
+    await run(ffmpegPath, ["-y", "-i", path, "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", "16000", rawPath], directory);
+    const raw = await readFile(rawPath);
+    const audio = new Float32Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
+    const result = await localTranscriber(audio, { chunk_length_s: 30, stride_length_s: 5, return_timestamps: true, language: "indonesian", task: "transcribe" });
     if (Array.isArray(result.chunks)) {
       for (const chunk of result.chunks) {
         const [start, end] = chunk.timestamp || [0, duration];
@@ -134,6 +138,8 @@ function chooseHighlightsLocal(segments, duration) {
   const hookWords = /\b(ternyata|rahasia|kesalahan|jangan|cara|kenapa|penting|masalah|solusi|tips|fakta|bayangkan|pertama|terbaik|terburuk)\b/gi;
   const fillerWords = /\b(eee+|emm+|anu|mungkin ya|apa namanya)\b/gi;
   const candidates = [];
+  const minimumDuration = Math.min(30, Math.max(1, duration * 0.5));
+  const maximumDuration = Math.min(70, duration);
   for (let startIndex = 0; startIndex < segments.length; startIndex += 1) {
     const start = segments[startIndex].start;
     let end = start;
@@ -142,7 +148,7 @@ function chooseHighlightsLocal(segments, duration) {
       end = segments[index].end;
       text.push(segments[index].text);
       const clipDuration = end - start;
-      if (clipDuration >= 30) {
+      if (clipDuration >= minimumDuration || index === segments.length - 1) {
         const joined = text.join(" ").trim();
         const words = joined.split(/\s+/).length;
         const hooks = (joined.match(hookWords) || []).length;
@@ -153,7 +159,7 @@ function chooseHighlightsLocal(segments, duration) {
         const score = Math.max(1, Math.min(99, Math.round(45 + lengthFit + hooks * 7 + punctuation * 2 + Math.min(12, speechDensity * 5) - fillers * 4)));
         candidates.push({ start, end: Math.min(end, duration), score, title: joined.split(/[.!?]/)[0].trim().slice(0, 90) || "Highlight pilihan", reason: hooks ? "Memiliki hook kuat dan pembahasan yang padat." : "Percakapan padat dengan sedikit jeda." });
       }
-      if (clipDuration >= 70) break;
+      if (clipDuration >= maximumDuration) break;
     }
   }
   const selected = [];
