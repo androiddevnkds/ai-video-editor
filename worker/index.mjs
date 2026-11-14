@@ -7,9 +7,12 @@ import { pipeline } from "node:stream/promises";
 import { spawn } from "node:child_process";
 import { get, put } from "@vercel/blob";
 import { createClient } from "@supabase/supabase-js";
+import { pipeline as createPipeline } from "@huggingface/transformers";
+import ffmpegPath from "ffmpeg-static";
+import ffprobeStatic from "ffprobe-static";
 import OpenAI from "openai";
 
-const required = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "BLOB_READ_WRITE_TOKEN", "OPENAI_API_KEY"];
+const required = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "BLOB_READ_WRITE_TOKEN"];
 for (const name of required) {
   if (!process.env[name]) throw new Error(`Missing required environment variable: ${name}`);
 }
@@ -17,9 +20,14 @@ for (const name of required) {
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const aiProvider = process.env.AI_PROVIDER || "local";
+if (aiProvider === "openai" && !process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required when AI_PROVIDER=openai");
+const openai = aiProvider === "openai" ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 const highlightModel = process.env.OPENAI_HIGHLIGHT_MODEL || "gpt-6-luna";
+const localWhisperModel = process.env.LOCAL_WHISPER_MODEL || "Xenova/whisper-small";
 const pollInterval = Number(process.env.WORKER_POLL_INTERVAL_MS || 5000);
+const ffprobePath = ffprobeStatic.path;
+let localTranscriber;
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -35,7 +43,7 @@ function run(command, args, cwd) {
 
 async function ffprobeDuration(input) {
   return new Promise((resolve, reject) => {
-    const child = spawn("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", input], { windowsHide: true });
+    const child = spawn(ffprobePath, ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", input], { windowsHide: true });
     let output = "";
     let error = "";
     child.stdout.on("data", (chunk) => { output += chunk.toString(); });
@@ -72,7 +80,7 @@ async function claimJob() {
   return claimed ? job : null;
 }
 
-async function transcribeChunks(directory) {
+async function transcribeChunksOpenAI(directory) {
   const files = (await readdir(directory)).filter((name) => name.endsWith(".mp3")).sort();
   const segments = [];
   let offset = 0;
@@ -99,7 +107,65 @@ async function transcribeChunks(directory) {
   return segments;
 }
 
+async function transcribeChunksLocal(directory) {
+  if (!localTranscriber) {
+    console.log(`Loading local speech model ${localWhisperModel}. The first run downloads the model once.`);
+    localTranscriber = await createPipeline("automatic-speech-recognition", localWhisperModel, { dtype: "q8" });
+  }
+  const files = (await readdir(directory)).filter((name) => name.endsWith(".mp3")).sort();
+  const segments = [];
+  let offset = 0;
+  for (const name of files) {
+    const path = join(directory, name);
+    const duration = await ffprobeDuration(path);
+    const result = await localTranscriber(path, { chunk_length_s: 30, stride_length_s: 5, return_timestamps: true, language: "indonesian", task: "transcribe" });
+    if (Array.isArray(result.chunks)) {
+      for (const chunk of result.chunks) {
+        const [start, end] = chunk.timestamp || [0, duration];
+        if (chunk.text?.trim()) segments.push({ start: offset + Number(start || 0), end: offset + Number(end || duration), text: chunk.text.trim() });
+      }
+    } else if (result.text?.trim()) segments.push({ start: offset, end: offset + duration, text: result.text.trim() });
+    offset += duration;
+  }
+  return segments;
+}
+
+function chooseHighlightsLocal(segments, duration) {
+  const hookWords = /\b(ternyata|rahasia|kesalahan|jangan|cara|kenapa|penting|masalah|solusi|tips|fakta|bayangkan|pertama|terbaik|terburuk)\b/gi;
+  const fillerWords = /\b(eee+|emm+|anu|mungkin ya|apa namanya)\b/gi;
+  const candidates = [];
+  for (let startIndex = 0; startIndex < segments.length; startIndex += 1) {
+    const start = segments[startIndex].start;
+    let end = start;
+    const text = [];
+    for (let index = startIndex; index < segments.length; index += 1) {
+      end = segments[index].end;
+      text.push(segments[index].text);
+      const clipDuration = end - start;
+      if (clipDuration >= 30) {
+        const joined = text.join(" ").trim();
+        const words = joined.split(/\s+/).length;
+        const hooks = (joined.match(hookWords) || []).length;
+        const fillers = (joined.match(fillerWords) || []).length;
+        const punctuation = (joined.match(/[?!]/g) || []).length;
+        const speechDensity = words / Math.max(clipDuration, 1);
+        const lengthFit = Math.max(0, 20 - Math.abs(50 - clipDuration) * 0.4);
+        const score = Math.max(1, Math.min(99, Math.round(45 + lengthFit + hooks * 7 + punctuation * 2 + Math.min(12, speechDensity * 5) - fillers * 4)));
+        candidates.push({ start, end: Math.min(end, duration), score, title: joined.split(/[.!?]/)[0].trim().slice(0, 90) || "Highlight pilihan", reason: hooks ? "Memiliki hook kuat dan pembahasan yang padat." : "Percakapan padat dengan sedikit jeda." });
+      }
+      if (clipDuration >= 70) break;
+    }
+  }
+  const selected = [];
+  for (const candidate of candidates.sort((a, b) => b.score - a.score)) {
+    if (selected.every((item) => candidate.end <= item.start || candidate.start >= item.end)) selected.push(candidate);
+    if (selected.length === 3) break;
+  }
+  return selected.sort((a, b) => a.start - b.start);
+}
+
 async function chooseHighlights(segments, duration) {
+  if (aiProvider === "local") return chooseHighlightsLocal(segments, duration);
   const compactTranscript = segments.map((item) => `[${item.start.toFixed(1)}-${item.end.toFixed(1)}] ${item.text}`).join("\n");
   const response = await openai.responses.create({
     model: highlightModel,
@@ -130,10 +196,10 @@ async function processJob(job) {
     await pipeline(Readable.fromWeb(blob.stream), createWriteStream(source));
 
     await updateJob(job.id, "extracting_audio", 15, "Mengekstrak dan membagi audio");
-    await run("ffmpeg", ["-y", "-i", source, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", "-f", "segment", "-segment_time", "600", join(workdir, "audio-%03d.mp3")], workdir);
+    await run(ffmpegPath, ["-y", "-i", source, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", "-f", "segment", "-segment_time", "600", join(workdir, "audio-%03d.mp3")], workdir);
 
     await updateJob(job.id, "transcribing", 32, "Membuat transcript bertimestamp");
-    const transcript = await transcribeChunks(workdir);
+    const transcript = aiProvider === "local" ? await transcribeChunksLocal(workdir) : await transcribeChunksOpenAI(workdir);
     if (!transcript.length) throw new Error("Tidak ada percakapan yang berhasil ditranskripsi");
 
     const duration = await ffprobeDuration(source);
@@ -146,7 +212,7 @@ async function processJob(job) {
     for (let index = 0; index < highlights.length; index += 1) {
       const clip = highlights[index];
       const output = join(workdir, `highlight-${index + 1}.mp4`);
-      await run("ffmpeg", ["-y", "-ss", String(clip.start), "-to", String(clip.end), "-i", source, "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", output], workdir);
+      await run(ffmpegPath, ["-y", "-ss", String(clip.start), "-to", String(clip.end), "-i", source, "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", output], workdir);
       rendered.push({ ...clip, output });
       await updateJob(job.id, "rendering", 70 + Math.round(((index + 1) / highlights.length) * 15), `Membuat klip ${index + 1} dari ${highlights.length}`);
     }
@@ -181,7 +247,7 @@ async function processJob(job) {
   }
 }
 
-console.log("Clipflow worker started. Waiting for queued jobs...");
+console.log(`Clipflow worker started with ${aiProvider} provider. Waiting for queued jobs...`);
 while (true) {
   try {
     const job = await claimJob();

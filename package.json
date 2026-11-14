@@ -10,8 +10,11 @@
     "worker": "node --env-file=.env.worker.local worker/index.mjs"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.3.2",
     "@supabase/supabase-js": "latest",
     "@vercel/blob": "2.4.0",
+    "ffmpeg-static": "^5.3.0",
+    "ffprobe-static": "^3.1.0",
     "lucide-react": "latest",
     "next": "latest",
     "openai": "^7.57.0",

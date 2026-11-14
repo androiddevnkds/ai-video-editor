@@ -21,19 +21,18 @@ Migration awal ada di `supabase/migrations`. Terapkan melalui Supabase CLI (`sup
 
 ## AI processing worker
 
-Worker lokal mengambil job dari `processing_jobs`, mengunduh private Blob, mengekstrak audio dengan FFmpeg, membuat transcript melalui OpenAI, memilih highlight, memotong video, dan mengunggah klip hasilnya.
+Worker lokal mengambil job dari `processing_jobs`, mengunduh private Blob, mengekstrak audio, membuat transcript, memilih highlight, memotong video, dan mengunggah klip hasilnya. Mode default sepenuhnya lokal dan tidak memakai API berbayar.
 
 Prasyarat:
 
 - Node.js 20+
-- FFmpeg dan FFprobe tersedia pada `PATH`
-- OpenAI API key dengan billing API aktif
+- Ruang disk untuk model Whisper lokal (diunduh sekali saat run pertama)
 
 Setup:
 
 1. Salin `.env.worker.example` menjadi `.env.worker.local`.
-2. Isi Supabase service-role key, Vercel Blob read-write token, dan OpenAI API key. Jangan commit file ini.
+2. Isi Supabase service-role key dan Vercel Blob read-write token. Jangan commit file ini.
 3. Jalankan `npm run worker`.
 4. Biarkan terminal worker tetap terbuka selama ingin memproses antrean.
 
-Model transkripsi default adalah `gpt-transcribe`. Model penilai highlight dapat diganti melalui `OPENAI_HIGHLIGHT_MODEL`.
+Mode gratis menggunakan Transformers.js, Whisper lokal `Xenova/whisper-small`, binary FFmpeg bawaan package, dan scoring highlight lokal. Untuk kembali memakai OpenAI, ubah `AI_PROVIDER=openai`, isi `OPENAI_API_KEY`, dan pilih model melalui `OPENAI_HIGHLIGHT_MODEL`.
