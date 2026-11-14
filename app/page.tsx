@@ -16,6 +16,7 @@ import {
   Eye,
   LoaderCircle,
   Trash2,
+  WandSparkles,
 } from "lucide-react";
 import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
 import type { User } from "@supabase/supabase-js";
@@ -33,6 +34,8 @@ type VideoRecord = {
   progress: number;
   created_at: string;
 };
+type JobRecord = { id: string; video_id: string; status: string; progress: number; stage_message: string; error_message: string | null };
+type ClipRecord = { id: string; video_id: string; title: string | null; reason: string | null; score: number | null; start_time_seconds: number; end_time_seconds: number };
 
 const MAX_VIDEO_SIZE = 2 * 1024 * 1024 * 1024;
 const VIDEO_TYPES = ["video/mp4", "video/quicktime", "video/webm", "video/x-matroska"];
@@ -59,6 +62,8 @@ export default function Dashboard() {
   const [actionId, setActionId] = useState("");
   const [fileAction, setFileAction] = useState<FileAction>(null);
   const [preview, setPreview] = useState<{ url: string; filename: string } | null>(null);
+  const [jobs, setJobs] = useState<Record<string, JobRecord>>({});
+  const [clips, setClips] = useState<ClipRecord[]>([]);
 
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => {
@@ -84,6 +89,25 @@ export default function Dashboard() {
         setVideos((data as VideoRecord[] | null) ?? []);
         setLoadingVideos(false);
       });
+  }, [user]);
+
+  useEffect(() => {
+    if (!user) return;
+    let active = true;
+    async function refreshProcessing() {
+      const [{ data: jobData }, { data: clipData }] = await Promise.all([
+        supabase.from("processing_jobs").select("id, video_id, status, progress, stage_message, error_message").order("created_at", { ascending: false }),
+        supabase.from("clips").select("id, video_id, title, reason, score, start_time_seconds, end_time_seconds").order("score", { ascending: false }),
+      ]);
+      if (!active) return;
+      const latestByVideo: Record<string, JobRecord> = {};
+      for (const job of (jobData as JobRecord[] | null) ?? []) if (!latestByVideo[job.video_id]) latestByVideo[job.video_id] = job;
+      setJobs(latestByVideo);
+      setClips((clipData as ClipRecord[] | null) ?? []);
+    }
+    refreshProcessing();
+    const timer = window.setInterval(refreshProcessing, 3000);
+    return () => { active = false; window.clearInterval(timer); };
   }, [user]);
 
   function chooseFile(candidate?: File) {
@@ -216,6 +240,51 @@ export default function Dashboard() {
     }
   }
 
+  async function queueProcessing(video: VideoRecord) {
+    if (!user) return;
+    setActionId(video.id);
+    setVideoError("");
+    try {
+      const { data: job, error: jobError } = await supabase.from("processing_jobs").insert({ video_id: video.id, user_id: user.id }).select("id, video_id, status, progress, stage_message, error_message").single();
+      if (jobError) throw jobError;
+      const { error: updateError } = await supabase.from("videos").update({ status: "queued", progress: 0 }).eq("id", video.id);
+      if (updateError) throw updateError;
+      setJobs((current) => ({ ...current, [video.id]: job as JobRecord }));
+      setVideos((current) => current.map((item) => item.id === video.id ? { ...item, status: "queued", progress: 0 } : item));
+    } catch (queueError) {
+      const message = queueError instanceof Error ? queueError.message : "Gagal memasukkan job ke antrean.";
+      setVideoError(message.includes("one_active_job") ? "Video ini sudah berada dalam antrean." : message);
+    } finally { setActionId(""); }
+  }
+
+  async function fetchClip(clip: ClipRecord, download = false) {
+    setActionId(clip.id);
+    setFileAction({ id: clip.id, kind: download ? "download" : "preview", progress: 0 });
+    try {
+      const { data } = await supabase.auth.getSession();
+      if (!data.session) throw new Error("Sesi login berakhir.");
+      const response = await fetch(`/api/clips/${clip.id}${download ? "?download=1" : ""}`, { headers: { Authorization: `Bearer ${data.session.access_token}` } });
+      if (!response.ok || !response.body) throw new Error("Gagal mengambil hasil klip.");
+      const total = Number(response.headers.get("content-length")) || 1;
+      const reader = response.body.getReader();
+      const chunks: BlobPart[] = [];
+      let received = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value); received += value.byteLength;
+        setFileAction({ id: clip.id, kind: download ? "download" : "preview", progress: Math.min(99, Math.round(received / total * 100)) });
+      }
+      const objectUrl = URL.createObjectURL(new Blob(chunks, { type: "video/mp4" }));
+      if (download) {
+        const anchor = document.createElement("a"); anchor.href = objectUrl; anchor.download = `${clip.title || "ai-highlight"}.mp4`; anchor.click();
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      } else setPreview({ url: objectUrl, filename: clip.title || "AI Highlight" });
+    } catch (clipError) {
+      setVideoError(clipError instanceof Error ? clipError.message : "Gagal mengambil klip.");
+    } finally { setActionId(""); setFileAction(null); }
+  }
+
   function closePreview() {
     if (preview) URL.revokeObjectURL(preview.url);
     setPreview(null);
@@ -301,10 +370,13 @@ export default function Dashboard() {
                   <div className="video-meta"><strong>{video.filename}</strong><span>{formatBytes(video.size_bytes)} · {new Date(video.created_at).toLocaleDateString("id-ID", { day: "numeric", month: "short", year: "numeric" })}</span></div>
                   <span className={`status-badge ${video.status}`}>{video.status === "uploaded" ? "Terupload" : video.status}</span>
                   <div className="video-actions">
+                    <button className="ai-action" title="Proses dengan AI" disabled={actionId === video.id || Boolean(jobs[video.id] && !["ready", "failed"].includes(jobs[video.id].status))} onClick={() => queueProcessing(video)}><WandSparkles size={16} /></button>
                     <button title="Preview" disabled={actionId === video.id} onClick={() => authorizedVideoRequest(video)}>{actionId === video.id ? <LoaderCircle className="spin" size={16} /> : <Eye size={16} />}</button>
                     <button title="Download" disabled={actionId === video.id} onClick={() => authorizedVideoRequest(video, true)}><Download size={16} /></button>
                     <button className="danger" title="Hapus" disabled={actionId === video.id} onClick={() => deleteVideo(video)}><Trash2 size={16} /></button>
                   </div>
+                  {jobs[video.id] && !["ready", "failed"].includes(jobs[video.id].status) && <div className="job-progress"><div><span>{jobs[video.id].stage_message}</span><b>{jobs[video.id].progress}%</b></div><div className="progress-track"><span style={{ width: `${jobs[video.id].progress}%` }} /></div></div>}
+                  {jobs[video.id]?.status === "failed" && <div className="job-error">Proses gagal: {jobs[video.id].error_message || "Coba jalankan kembali."}</div>}
                   {fileAction?.id === video.id && (
                     <div className="file-action-progress">
                       <div><span>{fileAction.kind === "preview" ? "Menyiapkan preview" : "Mengunduh video"}</span><b>{fileAction.progress}%</b></div>
@@ -316,6 +388,7 @@ export default function Dashboard() {
             </div>
           )}
         </section>
+        {clips.length > 0 && <section className="clips-panel"><div className="section-heading"><div><h2>Hasil AI</h2><p>Kandidat highlight yang siap direview dan diunduh.</p></div><span className="video-count">{clips.length} klip</span></div><div className="clip-grid">{clips.map((clip) => <article className="clip-card" key={clip.id}><div className="clip-score">{Math.round(clip.score || 0)}</div><div><strong>{clip.title || "AI Highlight"}</strong><p>{clip.reason}</p><span>{Math.round(clip.end_time_seconds - clip.start_time_seconds)} detik</span></div><div className="clip-actions"><button disabled={actionId === clip.id} onClick={() => fetchClip(clip)}><Eye size={15} /> Preview</button><button disabled={actionId === clip.id} onClick={() => fetchClip(clip, true)}><Download size={15} /> Download</button></div>{fileAction?.id === clip.id && <div className="file-action-progress"><div><span>{fileAction.kind === "preview" ? "Menyiapkan preview" : "Mengunduh klip"}</span><b>{fileAction.progress}%</b></div><div className="progress-track"><span style={{ width: `${fileAction.progress}%` }} /></div></div>}</article>)}</div></section>}
       </section>
       {preview && <div className="modal-backdrop" onClick={closePreview}><div className="video-modal" onClick={(event) => event.stopPropagation()}><div><strong>{preview.filename}</strong><button onClick={closePreview}><X size={18} /></button></div><video src={preview.url} controls autoPlay /></div></div>}
     </main>

@@ -6,13 +6,15 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "worker": "node --env-file=.env.worker.local worker/index.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "latest",
     "@vercel/blob": "2.4.0",
     "lucide-react": "latest",
     "next": "latest",
+    "openai": "^7.57.0",
     "react": "latest",
     "react-dom": "latest"
   },
