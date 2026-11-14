@@ -23,6 +23,7 @@ import { AuthForm } from "@/components/auth-form";
 import { supabase } from "@/lib/supabase";
 
 type UploadState = "idle" | "ready" | "uploading" | "done" | "error";
+type FileAction = { id: string; kind: "preview" | "download"; progress: number } | null;
 type VideoRecord = {
   id: string;
   filename: string;
@@ -56,6 +57,7 @@ export default function Dashboard() {
   const [loadingVideos, setLoadingVideos] = useState(false);
   const [videoError, setVideoError] = useState("");
   const [actionId, setActionId] = useState("");
+  const [fileAction, setFileAction] = useState<FileAction>(null);
   const [preview, setPreview] = useState<{ url: string; filename: string } | null>(null);
 
   useEffect(() => {
@@ -150,6 +152,7 @@ export default function Dashboard() {
 
   async function authorizedVideoRequest(video: VideoRecord, download = false) {
     setActionId(video.id);
+    setFileAction({ id: video.id, kind: download ? "download" : "preview", progress: 0 });
     setVideoError("");
     try {
       const { data } = await supabase.auth.getSession();
@@ -158,7 +161,24 @@ export default function Dashboard() {
         headers: { Authorization: `Bearer ${data.session.access_token}` },
       });
       if (!response.ok) throw new Error((await response.json()).error ?? "Gagal mengambil video.");
-      const objectUrl = URL.createObjectURL(await response.blob());
+      if (!response.body) throw new Error("Browser tidak mendukung progress download.");
+
+      const totalBytes = Number(response.headers.get("content-length")) || video.size_bytes;
+      const reader = response.body.getReader();
+      const chunks: BlobPart[] = [];
+      let receivedBytes = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        receivedBytes += value.byteLength;
+        const percentage = totalBytes > 0 ? Math.min(99, Math.round((receivedBytes / totalBytes) * 100)) : 0;
+        setFileAction({ id: video.id, kind: download ? "download" : "preview", progress: percentage });
+      }
+
+      setFileAction({ id: video.id, kind: download ? "download" : "preview", progress: 100 });
+      const objectUrl = URL.createObjectURL(new Blob(chunks, { type: response.headers.get("content-type") ?? video.content_type }));
       if (download) {
         const anchor = document.createElement("a");
         anchor.href = objectUrl;
@@ -172,6 +192,7 @@ export default function Dashboard() {
       setVideoError(requestError instanceof Error ? requestError.message : "Aksi gagal.");
     } finally {
       setActionId("");
+      setFileAction(null);
     }
   }
 
@@ -284,6 +305,12 @@ export default function Dashboard() {
                     <button title="Download" disabled={actionId === video.id} onClick={() => authorizedVideoRequest(video, true)}><Download size={16} /></button>
                     <button className="danger" title="Hapus" disabled={actionId === video.id} onClick={() => deleteVideo(video)}><Trash2 size={16} /></button>
                   </div>
+                  {fileAction?.id === video.id && (
+                    <div className="file-action-progress">
+                      <div><span>{fileAction.kind === "preview" ? "Menyiapkan preview" : "Mengunduh video"}</span><b>{fileAction.progress}%</b></div>
+                      <div className="progress-track"><span style={{ width: `${fileAction.progress}%` }} /></div>
+                    </div>
+                  )}
                 </article>
               ))}
             </div>
