@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@supabase/supabase-js": "latest",
     "@vercel/blob": "2.4.0",
     "lucide-react": "latest",
     "next": "latest",

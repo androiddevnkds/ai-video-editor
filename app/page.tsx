@@ -11,8 +11,12 @@ import {
   UploadCloud,
   Video,
   X,
+  LogOut,
 } from "lucide-react";
-import { ChangeEvent, DragEvent, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
+import type { User } from "@supabase/supabase-js";
+import { AuthForm } from "@/components/auth-form";
+import { supabase } from "@/lib/supabase";
 
 type UploadState = "idle" | "ready" | "uploading" | "done" | "error";
 
@@ -34,6 +38,20 @@ export default function Dashboard() {
   const [error, setError] = useState("");
   const [videoUrl, setVideoUrl] = useState("");
   const [dragging, setDragging] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
+  const [checkingAuth, setCheckingAuth] = useState(true);
+
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data }) => {
+      setUser(data.user);
+      setCheckingAuth(false);
+    });
+    const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+      setCheckingAuth(false);
+    });
+    return () => data.subscription.unsubscribe();
+  }, []);
 
   function chooseFile(candidate?: File) {
     setError("");
@@ -76,6 +94,18 @@ export default function Dashboard() {
         multipart: true,
         onUploadProgress: ({ percentage }) => setProgress(Math.round(percentage)),
       });
+      if (!user) throw new Error("Sesi login berakhir. Silakan masuk kembali.");
+      const { error: databaseError } = await supabase.from("videos").insert({
+        user_id: user.id,
+        filename: file.name,
+        original_url: blob.url,
+        pathname: blob.pathname,
+        content_type: file.type,
+        size_bytes: file.size,
+        status: "uploaded",
+        progress: 100,
+      });
+      if (databaseError) throw new Error(`Video terunggah, tetapi pencatatan database gagal: ${databaseError.message}`);
       setVideoUrl(blob.url);
       setProgress(100);
       setStatus("done");
@@ -94,6 +124,9 @@ export default function Dashboard() {
     if (inputRef.current) inputRef.current.value = "";
   }
 
+  if (checkingAuth) return <main className="loading-screen"><span className="brand-mark"><Play size={17} fill="currentColor" /></span><p>Menyiapkan workspace…</p></main>;
+  if (!user) return <AuthForm />;
+
   return (
     <main className="shell">
       <aside className="sidebar">
@@ -104,7 +137,8 @@ export default function Dashboard() {
         </nav>
         <div className="sidebar-bottom">
           <div className="mini-card"><Sparkles size={17} /><div><strong>MVP mode</strong><span>AI processing segera hadir</span></div></div>
-          <div className="avatar">NK</div><div className="profile"><strong>Creator</strong><span>Workspace pribadi</span></div>
+          <div className="avatar">{(user.email?.[0] ?? "C").toUpperCase()}</div><div className="profile"><strong>{user.user_metadata.display_name ?? "Creator"}</strong><span>{user.email}</span></div>
+          <button className="logout" title="Keluar" onClick={() => supabase.auth.signOut()}><LogOut size={15} /></button>
         </div>
       </aside>
 
