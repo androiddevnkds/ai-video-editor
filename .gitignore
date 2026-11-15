@@ -25,3 +25,12 @@ next-env.d.ts
 
 # Supabase CLI local state
 /supabase/.temp/
+
+# Local footage used to tune video detectors
+/sample/
+/samples/
+/.tmp/
+/.venv-tennis/
+/.vendor/
+**/__pycache__/
+*.pyc

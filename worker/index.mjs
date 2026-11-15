@@ -1,5 +1,5 @@
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { Readable } from "node:stream";
@@ -11,6 +11,7 @@ import { pipeline as createPipeline } from "@huggingface/transformers";
 import ffmpegPath from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
 import OpenAI from "openai";
+import { detectTennisHighlights } from "./tennis-detector.mjs";
 
 const required = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "BLOB_READ_WRITE_TOKEN"];
 for (const name of required) {
@@ -61,7 +62,7 @@ async function updateJob(id, status, progress, stage_message, extra = {}) {
 async function claimJob() {
   const { data: job, error } = await supabase
     .from("processing_jobs")
-    .select("id, video_id, user_id, videos!inner(filename, pathname, content_type)")
+    .select("id, video_id, user_id, mode, videos!inner(filename, pathname, content_type)")
     .eq("status", "queued")
     .order("created_at", { ascending: true })
     .limit(1)
@@ -194,12 +195,57 @@ async function chooseHighlights(segments, duration) {
 }
 
 async function processJob(job) {
+  if (job.mode === "cinematic") throw new Error("Mode Cinematic belum tersedia");
   const workdir = await mkdtemp(join(tmpdir(), "clipflow-"));
   const source = join(workdir, `source-${basename(job.videos.filename)}`);
   try {
     const blob = await get(job.videos.pathname, { access: "private" });
     if (!blob || blob.statusCode !== 200) throw new Error("Video Blob tidak ditemukan");
     await pipeline(Readable.fromWeb(blob.stream), createWriteStream(source));
+
+    if (job.mode === "tennis") {
+      const duration = await ffprobeDuration(source);
+      await updateJob(job.id, "analyzing", 35, "Mendeteksi impact dan kandidat rally tenis");
+      const { highlights, diagnostics } = await detectTennisHighlights({ source, workdir, ffmpegPath, run, duration });
+      if (!highlights.length) throw new Error("Tidak ditemukan rally tenis dengan minimal 2 kandidat pukulan");
+      await updateJob(job.id, "rendering", 70, `Memotong ${highlights.length} kandidat rally`, { transcript: { tennisDiagnostics: { impactCount: diagnostics.impacts.length, noiseFloorDb: diagnostics.noiseFloorDb, thresholdDb: diagnostics.thresholdDb } } });
+      const rendered = [];
+      for (let index = 0; index < highlights.length; index += 1) {
+        const clip = highlights[index];
+        const output = join(workdir, `highlight-${index + 1}.mp4`);
+        await run(ffmpegPath, ["-y", "-ss", String(clip.start), "-to", String(clip.end), "-i", source, "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", output], workdir);
+        const motionOutput = join(workdir, `ball-motion-${index + 1}.json`);
+        const pythonPath = process.env.TENNIS_PYTHON_PATH || join(process.cwd(), ".venv-tennis", "Scripts", "python.exe");
+        await run(pythonPath, [join(process.cwd(), "worker", "tennis_ball_motion.py"), output, "--output", motionOutput], workdir);
+        const motion = JSON.parse(await readFile(motionOutput, "utf8"));
+        const ballTracks = Array.isArray(motion.tracks) ? motion.tracks : [];
+        const netCrossings = Array.isArray(motion.netCrossings) ? motion.netCrossings : [];
+        if (motion.validRally && netCrossings.length > 0) {
+          rendered.push({
+            ...clip,
+            score: Math.min(99, clip.score + Math.min(12, ballTracks.length * 2)),
+            reason: `${clip.hitCount} kandidat pukulan, ${ballTracks.length} lintasan bola-like, dan ${netCrossings.length} perpindahan melewati net terdeteksi.`,
+            output,
+          });
+        }
+        await updateJob(job.id, "rendering", 70 + Math.round(((index + 1) / highlights.length) * 15), `Membuat rally ${index + 1} dari ${highlights.length}`);
+      }
+      if (!rendered.length) throw new Error("Tidak ada kandidat yang lolos validasi perpindahan bola");
+      const concatList = join(workdir, "tennis-highlights.txt");
+      await writeFile(concatList, rendered.map((clip) => `file '${clip.output.replaceAll("'", "'\\''")}'`).join("\n"));
+      const compilation = join(workdir, "tennis-highlights.mp4");
+      await run(ffmpegPath, ["-y", "-f", "concat", "-safe", "0", "-i", concatList, "-c", "copy", "-movflags", "+faststart", compilation], workdir);
+      const totalDuration = rendered.reduce((sum, clip) => sum + (clip.end - clip.start), 0);
+      await uploadRenderedClips(job, [{
+        start: 0,
+        end: totalDuration,
+        score: Math.round(rendered.reduce((sum, clip) => sum + clip.score, 0) / rendered.length),
+        title: "Tennis Highlights",
+        reason: `${rendered.length} rally terpilih digabung menjadi satu video highlight.`,
+        output: compilation,
+      }]);
+      return;
+    }
 
     await updateJob(job.id, "extracting_audio", 15, "Mengekstrak dan membagi audio");
     await run(ffmpegPath, ["-y", "-i", source, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", "-f", "segment", "-segment_time", "600", join(workdir, "audio-%03d.mp3")], workdir);
@@ -223,6 +269,18 @@ async function processJob(job) {
       await updateJob(job.id, "rendering", 70 + Math.round(((index + 1) / highlights.length) * 15), `Membuat klip ${index + 1} dari ${highlights.length}`);
     }
 
+    await uploadRenderedClips(job, rendered);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await supabase.from("videos").update({ status: "failed", error_message: message, updated_at: new Date().toISOString() }).eq("id", job.video_id);
+    await updateJob(job.id, "failed", 100, "Pemrosesan gagal", { error_message: message, completed_at: new Date().toISOString() });
+    console.error(`[job ${job.id}]`, error);
+  } finally {
+    await rm(workdir, { recursive: true, force: true });
+  }
+}
+
+async function uploadRenderedClips(job, rendered) {
     await updateJob(job.id, "uploading", 88, "Mengunggah hasil klip secara privat");
     for (let index = 0; index < rendered.length; index += 1) {
       const clip = rendered[index];
@@ -243,14 +301,6 @@ async function processJob(job) {
 
     await supabase.from("videos").update({ status: "ready", progress: 100, updated_at: new Date().toISOString() }).eq("id", job.video_id);
     await updateJob(job.id, "ready", 100, `${rendered.length} klip siap direview`, { completed_at: new Date().toISOString() });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await supabase.from("videos").update({ status: "failed", error_message: message, updated_at: new Date().toISOString() }).eq("id", job.video_id);
-    await updateJob(job.id, "failed", 100, "Pemrosesan gagal", { error_message: message, completed_at: new Date().toISOString() });
-    console.error(`[job ${job.id}]`, error);
-  } finally {
-    await rm(workdir, { recursive: true, force: true });
-  }
 }
 
 console.log(`Clipflow worker started with ${aiProvider} provider. Waiting for queued jobs...`);
